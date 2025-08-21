@@ -1,0 +1,105 @@
+{
+    "$id": "https://horizonrelevance.com/schemas/maas/ec2-liftshift.json",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "EC2 Lift-and-Shift (AWS) Blueprint",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["tenant_id", "name", "blueprint_key", "targets", "params"],
+    "properties": {
+      "tenant_id": { "type": "string", "minLength": 1 },
+      "name": { "type": "string", "minLength": 1 },
+      "blueprint_key": { "const": "ec2-liftshift" },
+      "targets": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,128}$"
+        },
+        "uniqueItems": true
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "region",
+          "vpc_id",
+          "private_subnet_ids",
+          "security_group_ids",
+          "instance_type_map",
+          "tg_health_check_path"
+        ],
+        "properties": {
+          "region": {
+            "type": "string",
+            "pattern": "^[a-z]{2}-[a-z]+-\\d$",
+            "examples": ["us-east-1", "eu-west-2"]
+          },
+          "vpc_id": {
+            "type": "string",
+            "pattern": "^vpc-([0-9a-f]{8}|[0-9a-f]{17})$"
+          },
+          "private_subnet_ids": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "string",
+              "pattern": "^subnet-([0-9a-f]{8}|[0-9a-f]{17})$"
+            },
+            "uniqueItems": true
+          },
+          "security_group_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "pattern": "^sg-([0-9a-f]{8}|[0-9a-f]{17})$"
+            },
+            "uniqueItems": true
+          },
+          "instance_type_map": {
+            "type": "object",
+            "description": "key = target hostname/asset id, value = EC2 instance type; targets without a key use the default chosen in the UI.",
+            "additionalProperties": {
+              "type": "string",
+              "pattern": "^[a-z0-9]+\\.?[a-z0-9]*\\.(nano|micro|small|medium|large|xlarge|[2-9]xlarge|[1-9][0-9]xlarge)$"
+            }
+          },
+          "tg_health_check_path": {
+            "type": "string",
+            "pattern": "^/.*$",
+            "default": "/healthz"
+          },
+          "attach_backup": { "type": "boolean", "default": true },
+          "kms_key_alias": {
+            "type": "string",
+            "pattern": "^alias/[A-Za-z0-9/_-]{1,256}$",
+            "default": "alias/tenant-data"
+          },
+          "blue_green": { "type": "boolean", "default": true },
+          "smoke_tests": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "url", "expect"],
+              "properties": {
+                "type": { "const": "http" },
+                "url": { "type": "string", "format": "uri" },
+                "expect": { "type": "integer", "enum": [200, 204] }
+              }
+            }
+          },
+          "tags": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^[A-Za-z0-9._:/+=@-]{1,128}$"
+            },
+            "additionalProperties": { "type": "string", "maxLength": 256 }
+          },
+          "maintenance_window": { "type": "string", "maxLength": 128 }
+        }
+      }
+    }
+  }
+  

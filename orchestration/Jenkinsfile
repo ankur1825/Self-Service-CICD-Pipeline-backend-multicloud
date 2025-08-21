@@ -1,0 +1,95 @@
+// Jenkinsfile for maas-plan / maas-execute / maas-cutover
+pipeline {
+  agent any
+  parameters {
+    string(name: 'WAVE_ID', defaultValue: '', description: 'Wave ID')
+    text(name: 'WAVE_JSON', defaultValue: '', description: 'Wave JSON from API')
+    choice(name: 'MODE', choices: ['plan','execute','test','prod'], description: 'plan/execute/test/prod')
+  }
+  environment {
+    AWS_DEFAULT_REGION = 'us-east-1'
+    PYTHONUNBUFFERED = '1'
+  }
+  stages {
+    stage('Parse Wave JSON') {
+      steps {
+        writeFile file: 'wave.json', text: params.WAVE_JSON
+        script {
+          def wave = readJSON file: 'wave.json'
+          env.TENANT_ID = wave.tenant_id
+          env.REGION     = wave.params.region
+          env.VPC_ID     = wave.params.vpc_id
+        }
+        sh 'jq . wave.json || cat wave.json'
+      }
+    }
+
+    stage('Assume Tenant Role') {
+      steps {
+        // Fetch tenant from your API (or inject via Jenkins creds)
+        sh '''
+          # demo: hard-code role lookup or curl your /tenants endpoint
+          TENANT_ROLE_ARN="${TENANT_ROLE_ARN:-arn:aws:iam::426946630837:role/SaaSProvisionerRole}"
+          EXTERNAL_ID="${EXTERNAL_ID:-TENANT-EXT-ID}"
+          CREDS=$(aws sts assume-role --role-arn "$TENANT_ROLE_ARN" --role-session-name "maas-$TENANT_ID" --external-id "$EXTERNAL_ID" --query 'Credentials' --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+          aws sts get-caller-identity
+        '''
+      }
+    }
+
+    stage('Plan Landing Zone') {
+      when { expression { return params.MODE == 'plan' || params.MODE == 'execute' } }
+      steps {
+        dir('iac/modules/landing-zone') {
+          sh '''
+            terraform init -input=false
+            terraform validate
+            terraform plan -input=false \
+              -var "region=$REGION" \
+              -var "existing_vpc_id=$VPC_ID"
+          '''
+        }
+      }
+    }
+
+    stage('Apply Landing Zone') {
+      when { expression { return params.MODE == 'execute' } }
+      steps {
+        dir('iac/modules/landing-zone') {
+          sh '''
+            terraform apply -auto-approve -input=false \
+              -var "region=$REGION" \
+              -var "existing_vpc_id=$VPC_ID"
+          '''
+        }
+      }
+    }
+
+    stage('MGN Setup / Replication') {
+      when { expression { return params.MODE == 'execute' } }
+      steps {
+        sh '''
+          python3 ops/mgn_setup.py --wave wave.json
+        '''
+      }
+    }
+
+    stage('Cutover') {
+      when { expression { return params.MODE == 'test' || params.MODE == 'prod' } }
+      steps {
+        sh '''
+          python3 ops/cutover.py --wave wave.json --mode ${MODE}
+        '''
+      }
+    }
+  }
+  post {
+    always {
+      archiveArtifacts artifacts: 'wave.json, **/terraform.tfstate*, **/*.plan, logs/**', fingerprint: true
+    }
+  }
+}
+

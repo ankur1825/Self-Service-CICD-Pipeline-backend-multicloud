@@ -1,0 +1,18 @@
+{
+    "ui:order": ["name", "targets", "params"],
+    "name": { "ui:help": "Human-friendly label of this wave (e.g., Wave-1)" },
+    "targets": { "ui:widget": "textarea", "ui:options": { "rows": 3 } },
+    "params": {
+      "ui:field": "Sectioned",
+      "region": { "ui:title": "Region" },
+      "vpc_id": { "ui:title": "VPC ID" },
+      "private_subnet_ids": { "ui:title": "Private Subnet IDs" },
+      "security_group_ids": { "ui:title": "Security Group IDs" },
+      "tg_health_check_path": { "ui:title": "Target Group Health Check Path", "ui:placeholder": "/healthz" },
+      "instance_type_map": { "ui:widget": "kvTextarea", "ui:help": "host=type, one per line" },
+      "smoke_tests": { "items": { "url": { "ui:placeholder": "https://app.domain.com/healthz" } } },
+      "kms_key_alias": { "ui:placeholder": "alias/tenant-data" },
+      "tags": { "ui:widget": "kvInline" }
+    }
+  }
+  
