@@ -731,6 +731,17 @@ def _jenkins_build(job: str, params: dict) -> int:
     )
     return r.status_code
 
+def _jenkins_last_build_number(job: str) -> Optional[int]:
+    try:
+        j = requests.get(
+            f"{JENKINS_URL}/job/{job}/api/json",
+            auth=(JENKINS_USER, JENKINS_TOKEN),
+            verify=False
+        ).json()
+        return (j.get("lastBuild") or {}).get("number")
+    except Exception:
+        return None
+
 # --- helper: resolve account by ref
 def _resolve_account(tenant_id: str, account_ref: str) -> dict:
     t = TENANTS.get(tenant_id) or {}
@@ -743,11 +754,9 @@ def _resolve_account(tenant_id: str, account_ref: str) -> dict:
 
 @waves_router.post("")
 def create_wave(req: WaveCreate):
-    # validate AWS placements strictly
-    for pl in req.placements:
-        if pl.provider == "aws":
-            # throws if invalid
-            AwsPlacementParams(**pl.params)
+    t = TENANTS.get(req.tenant_id)
+    if not t:
+        return JSONResponse(status_code=400, content={"error": f"unknown tenant_id {req.tenant_id}"})
     wave_id = f"wave-{uuid4().hex[:10]}"
     WAVES[wave_id] = req.dict()
     return {"id": wave_id, "status": "created"}
@@ -755,61 +764,87 @@ def create_wave(req: WaveCreate):
 @waves_router.post("/{wave_id}/plan")
 def plan_wave(wave_id: str):
     wave = WAVES.get(wave_id)
-    if not wave:
-        return JSONResponse(status_code=404, content={"error": "wave not found"})
+    if not wave: return JSONResponse(status_code=404, content={"error": "wave not found"})
+    t = TENANTS.get(wave["tenant_id"])
+    if not t:     return JSONResponse(status_code=400, content={"error": "tenant not registered"})
 
-    # Build TENANT_CONTEXT per-placement so the library can assume roles
-    tenant_ctx = {"tenant_id": wave["tenant_id"], "placements": []}
-    for pl in wave["placements"]:
-        if pl["provider"] == "aws":
-            acc = _resolve_account(wave["tenant_id"], pl["params"]["account_ref"])
-            tenant_ctx["placements"].append({"id": pl["id"], "provider": "aws", "account": acc})
-
+    exec_id = f"exec-{uuid4().hex[:10]}"
+    EXECUTIONS[exec_id] = {"wave_id": wave_id, "job": "maas-plan"}
     code = _jenkins_build("maas-plan", {
         "WAVE_ID": wave_id,
         "WAVE_JSON": json.dumps(wave),
-        "TENANT_CONTEXT": json.dumps(tenant_ctx)
+        "TENANT_ROLE_ARN": t["provisioner_role_arn"],
+        "EXTERNAL_ID": t["external_id"],
+        "STATE_BUCKET": t["state_bucket"],
+        "LOCK_TABLE": t["lock_table"]
     })
-    return {"status": "queued", "jenkins_code": code}
+    return {"status": "queued", "jenkins_code": code, "execution_id": exec_id}
 
 @waves_router.post("/{wave_id}/execute")
 def execute_wave(wave_id: str):
     wave = WAVES.get(wave_id)
-    if not wave:
-        return JSONResponse(status_code=404, content={"error": "wave not found"})
+    if not wave: return JSONResponse(status_code=404, content={"error": "wave not found"})
+    t = TENANTS.get(wave["tenant_id"])
+    if not t:     return JSONResponse(status_code=400, content={"error": "tenant not registered"})
 
-    tenant_ctx = {"tenant_id": wave["tenant_id"], "placements": []}
-    for pl in wave["placements"]:
-        if pl["provider"] == "aws":
-            acc = _resolve_account(wave["tenant_id"], pl["params"]["account_ref"])
-            tenant_ctx["placements"].append({"id": pl["id"], "provider": "aws", "account": acc})
-
+    exec_id = f"exec-{uuid4().hex[:10]}"
+    EXECUTIONS[exec_id] = {"wave_id": wave_id, "job": "maas-execute"}
     code = _jenkins_build("maas-execute", {
         "WAVE_ID": wave_id,
         "WAVE_JSON": json.dumps(wave),
-        "TENANT_CONTEXT": json.dumps(tenant_ctx)
+        "TENANT_ROLE_ARN": t["provisioner_role_arn"],
+        "EXTERNAL_ID": t["external_id"],
+        "STATE_BUCKET": t["state_bucket"],
+        "LOCK_TABLE": t["lock_table"]
     })
-    return {"status": "queued", "jenkins_code": code}
+    return {"status": "queued", "jenkins_code": code, "execution_id": exec_id}
 
 @waves_router.post("/{wave_id}/cutover")
 def cutover_wave(wave_id: str, mode: Literal["test","prod"] = Query(...)):
     wave = WAVES.get(wave_id)
-    if not wave:
-        return JSONResponse(status_code=404, content={"error": "wave not found"})
+    if not wave: return JSONResponse(status_code=404, content={"error": "wave not found"})
+    t = TENANTS.get(wave["tenant_id"])
+    if not t:     return JSONResponse(status_code=400, content={"error": "tenant not registered"})
 
-    tenant_ctx = {"tenant_id": wave["tenant_id"], "placements": []}
-    for pl in wave["placements"]:
-        if pl["provider"] == "aws":
-            acc = _resolve_account(wave["tenant_id"], pl["params"]["account_ref"])
-            tenant_ctx["placements"].append({"id": pl["id"], "provider": "aws", "account": acc})
-
+    exec_id = f"exec-{uuid4().hex[:10]}"
+    EXECUTIONS[exec_id] = {"wave_id": wave_id, "job": "maas-cutover", "mode": mode}
     code = _jenkins_build("maas-cutover", {
         "WAVE_ID": wave_id,
         "MODE": mode,
         "WAVE_JSON": json.dumps(wave),
-        "TENANT_CONTEXT": json.dumps(tenant_ctx)
+        "TENANT_ROLE_ARN": t["provisioner_role_arn"],
+        "EXTERNAL_ID": t["external_id"],
+        "STATE_BUCKET": t["state_bucket"],
+        "LOCK_TABLE": t["lock_table"]
     })
-    return {"status": "queued", "jenkins_code": code}
+    return {"status": "queued", "jenkins_code": code, "execution_id": exec_id}
+
+@app.get("/executions/{exec_id}/logs")
+def get_execution_logs(exec_id: str):
+    ex = EXECUTIONS.get(exec_id)
+    if not ex:
+        return JSONResponse(status_code=404, content={"error": "execution not found"})
+    job = ex["job"]
+    num = _jenkins_last_build_number(job)
+    if not num:
+        return {"status": "queued", "logs": ""}
+
+    # progressive console
+    log = requests.get(
+        f"{JENKINS_URL}/job/{job}/{num}/logText/progressiveText",
+        auth=(JENKINS_USER, JENKINS_TOKEN),
+        verify=False
+    ).text
+
+    # status
+    jb = requests.get(
+        f"{JENKINS_URL}/job/{job}/{num}/api/json",
+        auth=(JENKINS_USER, JENKINS_TOKEN),
+        verify=False
+    ).json()
+    state = (jb.get("result") or "RUNNING").lower()
+    return {"status": "succeeded" if state == "success" else ("failed" if state=="failure" else "running"),
+            "logs": log}
 
 @waves_router.get("/{wave_id}/summary")
 def wave_summary(wave_id: str):
