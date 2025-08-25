@@ -21,6 +21,13 @@ variable "vault_kms_key_arn" {
   default     = ""
 }
 
+# --- Added to align with Jenkins tfvars ---
+variable "kms_key_alias" {
+  description = "Optional KMS key alias (e.g. alias/tenant-data). If ARN not provided, module can resolve alias to ARN."
+  type        = string
+  default     = "alias/tenant-data"
+}
+
 variable "plan_name" {
   description = "Backup plan name"
   type        = string
@@ -74,4 +81,23 @@ variable "destination_vault_kms_key_arn" {
   description = "KMS key ARN for the destination vault (optional)"
   type        = string
   default     = ""
+}
+
+# --- Added: shorthand used by Jenkins tfvars ---
+variable "copy_to_region" {
+  description = "If set, enables cross-Region copy to this region (shorthand for enable_cross_region_copy + destination_region)."
+  type        = string
+  nullable    = true
+  default     = null
+}
+
+# --- Locals to unify both styles (copy_to_region vs existing flags) ---
+locals {
+  effective_enable_cross_region_copy = (
+    var.copy_to_region != null && var.copy_to_region != "" ? true : var.enable_cross_region_copy
+  )
+
+  effective_destination_region = (
+    var.copy_to_region != null && var.copy_to_region != "" ? var.copy_to_region : var.destination_region
+  )
 }
