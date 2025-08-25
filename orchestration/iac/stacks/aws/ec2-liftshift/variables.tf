@@ -10,8 +10,10 @@ variable "region" {
 variable "vpc_id" { 
     type = string 
 }
-variable "subnet_ids" { 
-    type = list(string) 
+variable "subnet_ids" {
+  type     = list(string)
+  default  = null
+  nullable = true
 }
 variable "private_subnet_ids" { 
     type = list(string) 
