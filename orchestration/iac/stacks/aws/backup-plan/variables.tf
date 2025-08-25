@@ -15,6 +15,24 @@ variable "vault_name" {
   default     = "maas-backup-vault"
 }
 
+variable "create_vault" {
+  description = "Create the backup vault (false = use existing by name)"
+  type        = bool
+  default     = false
+}
+
+variable "iam_role_name" {
+  description = "Name of IAM role used by AWS Backup selection"
+  type        = string
+  default     = "maas-backup-role"
+}
+
+variable "create_iam_role" {
+  description = "Create the IAM role (false = use existing by name)"
+  type        = bool
+  default     = false
+}
+
 variable "vault_kms_key_arn" {
   description = "KMS key ARN to encrypt the backup vault (optional)"
   type        = string
