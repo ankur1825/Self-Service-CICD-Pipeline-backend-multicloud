@@ -24,6 +24,7 @@ variable "security_group_ids" {
 }
 variable "instance_type_map" { 
     type = map(string) 
+    default = {}
 }
 variable "tg_health_check_path" { 
     type = string 
@@ -48,4 +49,8 @@ variable "copy_to_region" {
 variable "tags" { 
     type = map(string) 
     default = {} 
+}
+variable "instance_type" {
+  type    = string
+  default = "m6i.large"
 }

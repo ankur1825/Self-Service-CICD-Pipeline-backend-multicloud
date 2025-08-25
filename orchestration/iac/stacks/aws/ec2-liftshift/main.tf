@@ -46,7 +46,7 @@ resource "aws_lb_listener" "http" {
 resource "aws_launch_template" "lt" {
   name_prefix   = "maas-lt-"
   image_id      = "ami-00000000000000000"  # placeholder; MGN overrides on launch
-  instance_type = "m6i.large"
+  instance_type = local.primary_it
   vpc_security_group_ids = var.security_group_ids
   tag_specifications { 
     resource_type = "instance" 
@@ -60,17 +60,45 @@ resource "aws_autoscaling_group" "asg" {
   desired_capacity    = length(var.instance_type_map)
   min_size            = 0
   max_size            = length(var.instance_type_map)
-  vpc_zone_identifier = local.effective_subnet_ids  # <= was var.subnet_ids
-  launch_template { 
-    id = aws_launch_template.lt.id 
-    version = "$Latest" 
+  vpc_zone_identifier = local.effective_subnet_ids
+
+  # If there is only ONE instance type, attach the LT directly
+  dynamic "launch_template" {
+    for_each = local.use_mip ? [] : [1]
+    content {
+      id      = aws_launch_template.lt.id
+      version = "$Latest"
     }
+  }
+
+  # If there are MULTIPLE instance types, use MixedInstancesPolicy with overrides
+  dynamic "mixed_instances_policy" {
+    for_each = local.use_mip ? [1] : []
+    content {
+      launch_template {
+        launch_template_specification {
+          launch_template_id = aws_launch_template.lt.id
+          version            = "$Latest"
+        }
+        dynamic "override" {
+          for_each = toset(local.map_types)
+          content {
+            instance_type = override.value
+          }
+        }
+      }
+      # (Optional) add on_demand_base_capacity / on_demand_percentage_above_base_capacity
+      # if you want Spot mixing later.
+    }
+  }
+
   target_group_arns = [aws_lb_target_group.prod.arn]
-  tag { 
-    key = "Name" 
-    value = "maas-ec2" 
-    propagate_at_launch = true 
-    }
+
+  tag {
+    key                 = "Name"
+    value               = "maas-ec2"
+    propagate_at_launch = true
+  }
 }
 
 output "alb_dns_name" { 
