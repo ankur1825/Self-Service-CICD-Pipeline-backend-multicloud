@@ -3,8 +3,8 @@ namespaceOverride: horizon-relevance-dev
 replicaCount: 1
 
 image:
-  repository: ankur1825/horizon-self-service-cicd-pipeline-backend
-  tag: "1.4.4"
+  repository: ankur1825/horizon-self-service-cicd-pipeline-backend-multicloud
+  tag: "12"
   pullPolicy: IfNotPresent
 
 service:

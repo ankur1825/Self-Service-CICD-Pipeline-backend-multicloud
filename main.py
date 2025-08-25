@@ -1,12 +1,12 @@
-from fastapi import FastAPI, Request, Depends, Header, APIRouter, Query
+from fastapi import FastAPI, Request, Depends, Header, APIRouter, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, AnyUrl, constr
-from typing import List, Optional, Dict, Literal
 from datetime import datetime
 import os
+import time
 import requests
 from ldap3 import Server, Connection, ALL, SUBTREE
 import logging
@@ -14,11 +14,19 @@ import json
 import hmac
 import hashlib
 from uuid import uuid4
+from pathlib import Path
+from typing import List, Optional, Dict, Literal, Any, Set
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError, BotoCoreError
+except Exception:
+    boto3 = None
 
 from database import SessionLocal, engine, Base
 from models import Application, ApplicationUserAccess, Vulnerability
 
-DATABASE_PATH = "/app/data/app.db"  # This path must match your Helm `mountPath`
+DATABASE_PATH = "/app/data/app.db"  # must match your Helm mountPath
 
 # ----------------- WAVES ROUTER (Jenkins orchestration) -----------------
 waves_router = APIRouter(prefix="/waves", tags=["waves"])
@@ -27,7 +35,8 @@ waves_router = APIRouter(prefix="/waves", tags=["waves"])
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(root_path="/pipeline/api")
+# With your ingress rewrite (/pipeline/api -> /), no root_path is needed.
+app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
 
@@ -53,9 +62,13 @@ SEARCH_FILTER = "(objectClass=person)"
 # CORS setup for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://horizonrelevance.com/pipeline"],
+    allow_origins=[
+        "https://horizonrelevance.com",
+        "https://www.horizonrelevance.com",
+        # "http://localhost:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -68,11 +81,15 @@ def get_db():
         db.close()
 
 # Serve JSON/UI schemas so the frontend can fetch them
+Path("schemas").mkdir(parents=True, exist_ok=True)
 app.mount("/schemas", StaticFiles(directory="schemas"), name="schemas")
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 # ----------------- TENANT REGISTRY -----------------
-# In-memory for now. Move to DB when ready.
-TENANTS: Dict[str, dict] = {}  # tenant_id -> { account_id, role arn, external id, tf state info, ... }
+TENANTS: Dict[str, dict] = {}  # tenant_id -> { accounts, role arn, external id, tf state info, ... }
 
 class PipelineRequest(BaseModel):
     project_name: str
@@ -114,9 +131,9 @@ class OPARiskModel(BaseModel):
     violation: str
     severity: str
     risk_score: float
-    package_name: Optional[str] = "OPA Policy"       
-    installed_version: Optional[str] = "N/A"  
-    source: Optional[str] = "OPA"    
+    package_name: Optional[str] = "OPA Policy"
+    installed_version: Optional[str] = "N/A"
+    source: Optional[str] = "OPA"
     description: Optional[str] = ""
     remediation: Optional[str] = ""
     jenkins_job: Optional[str] = None
@@ -140,34 +157,25 @@ class RegisterAppRequest(BaseModel):
     name: str
     description: Optional[str] = None
     owner_email: str
-    repo_url: str 
+    repo_url: str
     branch: str = "main"
 
 class GrantAccessRequest(BaseModel):
     user_email: str
-    application: str    
+    application: str
 
 class TenantUpsert(BaseModel):
     id: str
-    # New: multi-cloud account map. Example:
-    # {
-    #   "aws": {
-    #     "prod":  {"role_arn":"...", "external_id":"...", "state_bucket":"...", "lock_table":"...", "default_region":"us-east-1"},
-    #     "nonprod": {...}
-    #   },
-    #   "azure": {...},
-    #   "gcp":   {...},
-    #   "oci":   {...}
-    # }
-    accounts: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None
+    # NEW (simple) shape: accounts[account_ref] = {"role_arn": "...", "external_id": "...", ...}
+    accounts: Optional[Dict[str, Dict[str, str]]] = None
 
-    # Backward compat (older single-account AWS style)
+    # Legacy single-account fields (still supported)
     account_id: Optional[str] = None
     provisioner_role_arn: Optional[str] = None
     external_id: Optional[str] = None
     state_bucket: Optional[str] = None
     lock_table: Optional[str] = None
-    regions: List[str] = ["us-east-1"]   
+    regions: List[str] = ["us-east-1"]
 
 # ---------- Models for EC2 Lift-and-Shift (AWS) ----------
 class SmokeTest(BaseModel):
@@ -176,8 +184,7 @@ class SmokeTest(BaseModel):
     expect: Literal[200, 204] = 200
 
 # ---------- Cloud Migration: multi-placement models ----------
-
-Provider = Literal["aws", "azure", "gcp", "oci"]    
+Provider = Literal["aws", "azure", "gcp", "oci"]
 
 class AwsPlacementParams(BaseModel):
     region: constr(regex=r"^[a-z]{2}-[a-z]+-\d$")
@@ -192,18 +199,15 @@ class AwsPlacementParams(BaseModel):
     attach_backup: bool = True
     kms_key_alias: constr(regex=r"^alias/[A-Za-z0-9/_-]{1,256}$") = "alias/tenant-data"
     blue_green: bool = True
-    smoke_tests: List[SmokeTest] = []
+    smoke_tests: List[SmokeTest] = Field(default_factory=list)
     tags: Dict[constr(regex=r"^[A-Za-z0-9._:/+=@-]{1,128}$"), constr(max_length=256)] = {}
     maintenance_window: Optional[constr(max_length=128)] = None
-    # optional cross-region copy for backup
     copy_to_region: Optional[constr(regex=r"^[a-z]{2}-[a-z]+-\d$")] = None
-    # account to use for this placement (key in TENANTS[tenant_id].accounts)
     account_ref: constr(min_length=1)
 
 class Placement(BaseModel):
     id: constr(min_length=1) = Field(default_factory=lambda: f"p-{uuid4().hex[:8]}")
     provider: Provider
-    # For now, only validate strictly for AWS. Others can be Dict[str, Any] until added.
     params: Dict[str, Any]
 
     @classmethod
@@ -216,7 +220,6 @@ class WaveCreate(BaseModel):
     name: constr(min_length=1)
     blueprint_key: Literal["ec2-liftshift"]
     targets: List[constr(regex=r"^[A-Za-z0-9._-]{1,128}$")] = Field(..., min_items=1)
-    # NEW: multiple placements (UI sends this)
     placements: List[Placement]
 
 @app.post("/login")
@@ -249,7 +252,7 @@ async def login(request: Request):
 
         return {"username": username, "fullName": display_name, "email": email}
 
-    except Exception as e:
+    except Exception:
         return JSONResponse(status_code=401, content={"error": "Invalid credentials or server error"})
 
 @app.get("/get_ldap_users")
@@ -274,28 +277,23 @@ def get_ldap_users():
                 seen.add(uid)
         conn.unbind()
         return JSONResponse(content=users)
-    except Exception as e:
+    except Exception:
         return JSONResponse(status_code=500, content={"error": "Failed to fetch LDAP users"})
-    
+
 @app.get("/my_applications")
 def get_user_applications(email: str, db: Session = Depends(get_db)):
     try:
-        print(f"[DEBUG] Incoming email: {email}")
         if email in ["ankur.kashyap@horizonrelevance.com"]:
             apps = db.query(Application.name).all()
-            print(f"[DEBUG] Admin access - apps: {apps}")
             return [a.name for a in apps]
 
         apps = db.query(Application.name).join(ApplicationUserAccess).filter(
             ApplicationUserAccess.user_email == email
         ).all()
-        print(f"[DEBUG] User apps: {apps}")
         return [a.name for a in apps]
 
-    except Exception as e:
-        print(f"[ERROR] in /my_applications: {e}")
+    except Exception:
         return JSONResponse(status_code=500, content={"error": "Failed to call backend"})
-
 
 @app.post("/pipeline")
 def create_pipeline(request: PipelineRequest):
@@ -405,48 +403,7 @@ def get_console_logs(job_name: str, build_number: int):
     response = requests.get(log_url, auth=(JENKINS_USER, JENKINS_TOKEN), verify=False)
     return {"build_number": build_number, "job_name": job_name, "logs": response.text}
 
-#vulnerabilities_store = []
-
-# @app.post("/vulnerabilities")
-# async def upload_vulnerabilities(payload: VulnerabilityUpload, db: Session = Depends(get_db)):
-#     count = 0
-#     default_app_name = "webserice-application"
-
-#     # Ensure application exists or create a dummy entry
-#     app_entry = db.query(Application).filter_by(name=default_app_name).first()
-#     if not app_entry:
-#         app_entry = Application(name=default_app_name, description="Auto-created", owner_email="auto@horizonrelevance.com")
-#         db.add(app_entry)
-#         db.commit()
-#         db.refresh(app_entry)
-
-#     for v in payload.vulnerabilities:
-#         vuln = Vulnerability(
-#             application_id=app_entry.id,
-#             target=v.target,
-#             package_name=v.package_name,
-#             installed_version=v.installed_version,
-#             vulnerability_id=v.vulnerability_id,
-#             severity=v.severity,
-#             fixed_version=v.fixed_version,
-#             risk_score=v.risk_score,
-#             description=v.description,
-#             source=v.source,
-#             timestamp=v.timestamp or datetime.utcnow(),
-#             line=v.line,
-#             rule=v.rule,
-#             status=v.status,
-#             predicted_severity=v.predictedSeverity,
-#             jenkins_job=v.jenkins_job,
-#             build_number=v.build_number,
-#             jenkins_url=v.jenkins_url
-#         )
-#         db.add(vuln)
-#         count += 1
-#     db.commit()
-#     return {"status": "uploaded", "count": count}
-
-# GET: return only authorized vulnerabilities
+# ----------------- Vulns (RBAC-filtered) -----------------
 @app.get("/vulnerabilities")
 def get_vulnerabilities(
     email: str,
@@ -503,17 +460,12 @@ def clear_vulnerabilities(db: Session = Depends(get_db)):
 @app.post("/opa/risks/")
 async def upload_opa_risks(payload: OPARiskUpload, db: Session = Depends(get_db)):
     try:
-        logger.info(f"Received OPA risks for application: {payload.application}")
-        logger.debug("Raw payload: %s", payload.dict())
-
         app_name = payload.application.strip()
         if not app_name:
             return JSONResponse(status_code=400, content={"error": "Application name is required"})
 
-        # Ensure application exists
         app_entry = db.query(Application).filter_by(name=app_name).first()
         if not app_entry:
-            logger.info(f"Creating new application entry: {app_name}")
             app_entry = Application(
                 name=app_name,
                 description="Auto-created",
@@ -526,7 +478,6 @@ async def upload_opa_risks(payload: OPARiskUpload, db: Session = Depends(get_db)
         count = 0
         for risk in payload.risks:
             if not risk.violation:
-                logger.warning(f"Skipping risk without violation: {risk}")
                 continue
 
             vuln = Vulnerability(
@@ -539,7 +490,7 @@ async def upload_opa_risks(payload: OPARiskUpload, db: Session = Depends(get_db)
                 fixed_version=risk.remediation or "Review policy",
                 risk_score=risk.risk_score,
                 description=risk.description or risk.violation,
-                source=risk.source or "OPA", 
+                source=risk.source or "OPA",
                 jenkins_job=risk.jenkins_job,
                 build_number=risk.build_number,
                 jenkins_url=risk.jenkins_url,
@@ -549,35 +500,22 @@ async def upload_opa_risks(payload: OPARiskUpload, db: Session = Depends(get_db)
             count += 1
 
         db.commit()
-        logger.info(f"Successfully stored {count} OPA-Kubernetes risks.")
         return {"status": "success", "received_count": count}
-
-    except Exception as e:
-        logger.exception("Failed to upload OPA risks")
+    except Exception:
         return JSONResponse(status_code=500, content={"error": "Server error while processing OPA risks"})
 
-
-def get_dynamic_fix(violation: str) -> str:
-    violation = violation.lower()
-    if "root user" in violation:
-        return "Use a non-root USER in Dockerfile"
-    elif "ssh port" in violation:
-        return "Avoid exposing port 22 unless explicitly needed"
-    elif "privileged" in violation:
-        return "Set privileged: false in your container configuration"
-    elif "capabilities" in violation:
-        return "Drop all Linux capabilities and add only required ones"
-    elif "no read-only" in violation or "writable" in violation:
-        return "Set filesystem to read-only using readOnlyRootFilesystem"
-    else:
-        return "Review OPA policy and secure container accordingly"
-    
 @app.post("/register_application")
 def register_application(request: RegisterAppRequest, db: Session = Depends(get_db)):
     app_entry = db.query(Application).filter_by(name=request.name).first()
     if app_entry:
         return JSONResponse(status_code=400, content={"error": "Application already exists"})
-    app_entry = Application(name=request.name, description=request.description, owner_email=request.owner_email, repo_url=request.repo_url, branch=request.branch)
+    app_entry = Application(
+        name=request.name,
+        description=request.description,
+        owner_email=request.owner_email,
+        repo_url=request.repo_url,
+        branch=request.branch
+    )
     db.add(app_entry)
     db.commit()
     db.refresh(app_entry)
@@ -597,7 +535,6 @@ def grant_access(request: GrantAccessRequest, db: Session = Depends(get_db)):
 def upload_vulnerabilities(payload: UploadPayload, db: Session = Depends(get_db)):
     try:
         app_entry = db.query(Application).filter_by(name=payload.application).first()
-
         if not app_entry:
             app_entry = Application(
                 name=payload.application,
@@ -608,7 +545,6 @@ def upload_vulnerabilities(payload: UploadPayload, db: Session = Depends(get_db)
             db.add(app_entry)
             db.commit()
             db.refresh(app_entry)
-            print(f"[App Created] {payload.application}")
 
         count = 0
         for v in payload.vulnerabilities:
@@ -636,12 +572,9 @@ def upload_vulnerabilities(payload: UploadPayload, db: Session = Depends(get_db)
             count += 1
 
         db.commit()
-        print(f"[Vulnerabilities Uploaded] Count: {count} for app: {payload.application}")
         return {"status": "uploaded", "count": count}
-
-    except Exception as e:
-        print(f"[Upload Error] {str(e)}")
-        return JSONResponse(status_code=500, content={"error": "Failed to upload vulnerabilities"})  
+    except Exception:
+        return JSONResponse(status_code=500, content={"error": "Failed to upload vulnerabilities"})
 
 def verify_github_signature(payload_body: bytes, signature_header: str) -> bool:
     expected_signature = "sha256=" + hmac.new(
@@ -657,18 +590,13 @@ async def github_webhook(
 ):
     try:
         body = await request.body()
-
         if not x_hub_signature_256:
             return JSONResponse(status_code=401, content={"error": "Missing signature"})
 
         expected_signature = "sha256=" + hmac.new(
-            GITHUB_WEBHOOK_SECRET.encode(),
-            msg=body,
-            digestmod=hashlib.sha256
+            GITHUB_WEBHOOK_SECRET.encode(), msg=body, digestmod=hashlib.sha256
         ).hexdigest()
-
         if not hmac.compare_digest(expected_signature, x_hub_signature_256):
-            print(f"[Signature Mismatch] Expected: {expected_signature}")
             return JSONResponse(status_code=401, content={"error": "Invalid signature"})
 
         payload = json.loads(body)
@@ -676,11 +604,10 @@ async def github_webhook(
         branch_ref = payload.get("ref", "")
         branch = branch_ref.split("/")[-1] if branch_ref.startswith("refs/heads/") else "main"
 
-        print(f"[Webhook] Repo: {repo_url}, Branch: {branch}")
-
-        app_match = db.query(Application).filter(Application.repo_url == repo_url, Application.branch == branch).first()
+        app_match = db.query(Application).filter(
+            Application.repo_url == repo_url, Application.branch == branch
+        ).first()
         if not app_match:
-            print(f"[Fallback] Trying to match repo only without branch: {repo_url}")
             app_match = db.query(Application).filter_by(repo_url=repo_url).first()
             if not app_match:
                 return JSONResponse(status_code=404, content={"error": "No matching pipeline found for repo"})
@@ -690,25 +617,17 @@ async def github_webhook(
         params = {
             "REPO_URL": repo_url,
             "BRANCH": branch,
-            "APP_TYPE": app_match.app_type or "unknown",
+            "APP_TYPE": getattr(app_match, "app_type", None) or "unknown",
             "CREDENTIALS_ID": "github-token",
             "ENABLE_SONARQUBE": "true",
             "ENABLE_OPA": "true",
             "ENABLE_TRIVY": "true"
         }
-
         response = requests.post(jenkins_url, auth=(JENKINS_USER, JENKINS_TOKEN), params=params, verify=False)
-
-        return {
-            "status": "Triggered Jenkins job",
-            "job": job_name,
-            "jenkins_code": response.status_code
-        }
-
-    except Exception as e:
-        print(f"[Webhook Error] {str(e)}")
+        return {"status": "Triggered Jenkins job", "job": job_name, "jenkins_code": response.status_code}
+    except Exception:
         return JSONResponse(status_code=500, content={"error": "Failed to process webhook"})
-    
+
 @app.post("/tenants")
 def register_tenant(t: TenantUpsert):
     TENANTS[t.id] = t.dict()
@@ -720,6 +639,185 @@ def get_tenant(tenant_id: str):
     if not t:
         return JSONResponse(status_code=404, content={"error": "tenant not found"})
     return t
+
+# ----------------- Cloud metadata helpers (AWS) -----------------
+_META_CACHE = {"regions": {}, "instance_types": {}}  # simple in-memory TTL cache
+_CACHE_TTL = 900  # seconds
+
+def _cache_get(bucket: dict, key: str):
+    rec = bucket.get(key)
+    if not rec:
+        return None
+    value, expires = rec
+    if time.time() > expires:
+        bucket.pop(key, None)
+        return None
+    return value
+
+def _cache_put(bucket: dict, key: str, value):
+    bucket[key] = (value, time.time() + _CACHE_TTL)
+
+def _lookup_account_conf(tenant_id: str, account_ref: str | None) -> dict:
+    """
+    Supports:
+      - NEW shape:  TENANTS[tenant]['accounts'][account_ref] -> {role_arn, ...}
+      - Compat:     TENANTS[tenant]['accounts'][provider][account_ref] -> {...}
+      - Legacy:     fields at tenant root (provisioner_role_arn, external_id, regions, ...)
+    """
+    t = TENANTS.get(tenant_id) or {}
+    accs = t.get("accounts") or {}
+
+    # New simple shape
+    if account_ref and account_ref in accs and isinstance(accs[account_ref], dict):
+        return accs[account_ref]
+
+    # Back-compat: provider -> account_ref
+    for _provider, envmap in accs.items():
+        if isinstance(envmap, dict) and account_ref in envmap:
+            maybe = envmap[account_ref]
+            if isinstance(maybe, dict) and "role_arn" in maybe:
+                return maybe
+
+    # Legacy single-account fields
+    legacy = {
+        "role_arn": t.get("provisioner_role_arn"),
+        "external_id": t.get("external_id"),
+        "default_region": (t.get("regions") or ["us-east-1"])[0] if t.get("regions") else "us-east-1",
+        "state_bucket": t.get("state_bucket"),
+        "lock_table": t.get("lock_table"),
+    }
+    if not legacy["role_arn"]:
+        raise ValueError("No account configuration found for tenant; register /tenants first.")
+    return legacy
+
+def _aws_session_via_role(role_arn: str, external_id: str | None):
+    if not boto3:
+        raise RuntimeError("boto3 not installed in backend image.")
+    sts = boto3.client("sts")
+    params = {"RoleArn": role_arn, "RoleSessionName": f"hrl-{int(time.time())}"}
+    if external_id:
+        params["ExternalId"] = external_id
+    creds = sts.assume_role(**params)["Credentials"]
+    return boto3.session.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+
+def _aws_client(service: str, region: str, tenant_id: str, account_ref: str | None):
+    conf = _lookup_account_conf(tenant_id, account_ref)
+    sess = _aws_session_via_role(conf["role_arn"], conf.get("external_id"))
+    return sess.client(service, region_name=region)
+
+# ----------------- Regions -----------------
+@app.get("/cloud/aws/regions")
+def list_aws_regions(
+    tenant_id: Optional[str] = None,
+    account_ref: Optional[str] = None,
+    include_opt_in: bool = True
+):
+    """
+    Returns list of region codes.
+      - If tenant_id omitted: return curated static list (UI-friendly default).
+      - If tenant_id provided: try live AWS via STS+EC2, else fall back to static.
+    """
+    if not tenant_id:
+        fallback = [
+            "us-east-1","us-east-2","us-west-1","us-west-2",
+            "eu-west-1","eu-west-2","eu-central-1",
+            "ap-south-1","ap-southeast-1","ap-southeast-2","ap-northeast-1"
+        ]
+        return {"regions": fallback, "source": "static"}
+
+    cache_key = f"{tenant_id or '_'}:{account_ref or '_'}:{'optin' if include_opt_in else 'noopt'}"
+    cached = _cache_get(_META_CACHE["regions"], cache_key)
+    if cached:
+        return {"regions": cached, "source": "cache"}
+
+    try:
+        ec2 = _aws_client("ec2", "us-east-1", tenant_id, account_ref)
+        resp = ec2.describe_regions(AllRegions=True)
+        regions = [
+            r["RegionName"]
+            for r in resp["Regions"]
+            if include_opt_in or r.get("OptInStatus") in (None, "opt-in-not-required", "opted-in")
+        ]
+        regions.sort()
+        _cache_put(_META_CACHE["regions"], cache_key, regions)
+        return {"regions": regions, "source": "aws"}
+    except Exception as e:
+        fallback = [
+            "us-east-1","us-east-2","us-west-1","us-west-2",
+            "eu-west-1","eu-west-2","eu-central-1",
+            "ap-south-1","ap-southeast-1","ap-southeast-2","ap-northeast-1"
+        ]
+        _cache_put(_META_CACHE["regions"], cache_key, fallback)
+        return {"regions": fallback, "source": "static", "warning": str(e)}
+
+# ----------------- Instance Types -----------------
+@app.get("/cloud/aws/instance-types")
+def list_instance_types(
+    region: str,
+    tenant_id: Optional[str] = None,
+    account_ref: Optional[str] = None,
+    family_prefix: Optional[str] = None  # e.g. "t3", "m6i", "c7g"
+):
+    """
+    Returns available instance types in a region.
+    If tenant/account cannot be used, returns a curated static list so the UI still works.
+    """
+    cache_key = f"{tenant_id or '_'}:{account_ref or '_'}:{region}:{family_prefix or '*'}"
+    cached = _cache_get(_META_CACHE["instance_types"], cache_key)
+    if cached:
+        return {"instance_types": cached, "source": "cache"}
+
+    # Try dynamic
+    try:
+        types: Set[str] = set()
+        if tenant_id:
+            ec2 = _aws_client("ec2", region, tenant_id, account_ref)
+            kwargs = {
+                "LocationType": "region",
+                "Filters": [{"Name": "location", "Values": [region]}],
+            }
+            while True:
+                resp = ec2.describe_instance_type_offerings(**kwargs)
+                for off in resp.get("InstanceTypeOfferings", []):
+                    it = off["InstanceType"]
+                    if not family_prefix or it.startswith(family_prefix):
+                        types.add(it)
+                token = resp.get("NextToken")
+                if not token:
+                    break
+                kwargs["NextToken"] = token
+
+        if types:
+            out = sorted(types)
+            _cache_put(_META_CACHE["instance_types"], cache_key, out)
+            return {"instance_types": out, "source": "aws"}
+    except Exception:
+        pass
+
+    # Static curated list
+    static = [
+        "t3.nano","t3.micro","t3.small","t3.medium","t3.large",
+        "t3.xlarge","t3.2xlarge","t4g.micro","t4g.small","t4g.medium","t4g.large",
+        "m6i.large","m6i.xlarge","m6i.2xlarge","m6i.4xlarge",
+        "c7g.large","c7g.xlarge","c7g.2xlarge","c7g.4xlarge"
+    ]
+    if family_prefix:
+        static = [t for t in static if t.startswith(family_prefix)]
+    _cache_put(_META_CACHE["instance_types"], cache_key, static)
+    return {"instance_types": static, "source": "static"}
+
+# ----------------- Simple pricing helper -----------------
+class PricingReq(BaseModel):
+    instance_types: List[str]
+
+@app.post("/cloud/aws/pricing/estimate")
+def estimate_price(req: PricingReq):
+    hourly = _estimate_cost_usd_per_hour(req.instance_types)
+    return {"hourly_usd": hourly, "monthly_usd": round(hourly * 730, 2)}
 
 # ---------- Jenkins helper ----------
 def _jenkins_build(job: str, params: dict) -> int:
@@ -742,7 +840,6 @@ def _jenkins_last_build_number(job: str) -> Optional[int]:
     except Exception:
         return None
 
-# --- helper: resolve account by ref
 def _resolve_account(tenant_id: str, account_ref: str) -> dict:
     t = TENANTS.get(tenant_id) or {}
     acc = (t.get("accounts") or {}).get(account_ref)
@@ -750,8 +847,52 @@ def _resolve_account(tenant_id: str, account_ref: str) -> dict:
         raise ValueError(f"unknown account_ref '{account_ref}' for tenant '{tenant_id}'")
     return acc
 
-# ---------- Waves router (multi-cloud placements) ----------
+# ---------- Build TENANT_CONTEXT for Jenkins ----------
+def _tenant_context_for_wave(wave: dict) -> dict:
+    """
+    Shape Jenkins expects:
+    {
+      "tenant_id": "...",
+      "placements": [
+        {"id": "p-xxxx", "account": {
+            "role_arn": "...",
+            "external_id": "...",
+            "state_bucket": "...",
+            "lock_table": "...",
+            "region": "us-east-1"   # optional
+        }},
+        ...
+      ]
+    }
+    """
+    t_id = wave.get("tenant_id")
+    tenant = TENANTS.get(t_id) or {}
+    placements_ctx = []
 
+    for pl in wave.get("placements", []):
+        pl_id = pl.get("id")
+        params = pl.get("params") or {}
+        acc_ref = params.get("account_ref")
+
+        try:
+            acc = _lookup_account_conf(t_id, acc_ref)
+        except Exception:
+            acc = {}
+
+        placements_ctx.append({
+            "id": pl_id,
+            "account": {
+                "role_arn": acc.get("role_arn") or tenant.get("provisioner_role_arn"),
+                "external_id": acc.get("external_id") or tenant.get("external_id"),
+                "state_bucket": acc.get("state_bucket") or tenant.get("state_bucket"),
+                "lock_table": acc.get("lock_table") or tenant.get("lock_table"),
+                "region": acc.get("default_region") or (tenant.get("regions") or [None])[0]
+            }
+        })
+
+    return {"tenant_id": t_id, "placements": placements_ctx}
+
+# ---------- Waves router (multi-cloud placements) ----------
 @waves_router.post("")
 def create_wave(req: WaveCreate):
     t = TENANTS.get(req.tenant_id)
@@ -762,49 +903,61 @@ def create_wave(req: WaveCreate):
     return {"id": wave_id, "status": "created"}
 
 @waves_router.post("/{wave_id}/plan")
-def plan_wave(wave_id: str):
-    wave = WAVES.get(wave_id)
-    if not wave: return JSONResponse(status_code=404, content={"error": "wave not found"})
-    t = TENANTS.get(wave["tenant_id"])
-    if not t:     return JSONResponse(status_code=400, content={"error": "tenant not registered"})
+def plan_wave(wave_id: str, payload: Optional[WaveCreate] = Body(default=None)):
+    # Use provided payload if present (stateless), else fall back to memory
+    wave = payload.dict() if payload else WAVES.get(wave_id)
+    if not wave:
+        return JSONResponse(status_code=404, content={"error": "wave not found; include payload or create first"})
+    if not TENANTS.get(wave["tenant_id"]):
+        return JSONResponse(status_code=400, content={"error": "tenant not registered"})
+
+    # keep an updated copy in memory
+    WAVES[wave_id] = wave
+    tenant_ctx = _tenant_context_for_wave(wave)
 
     exec_id = f"exec-{uuid4().hex[:10]}"
     EXECUTIONS[exec_id] = {"wave_id": wave_id, "job": "maas-plan"}
     code = _jenkins_build("maas-plan", {
         "WAVE_ID": wave_id,
         "WAVE_JSON": json.dumps(wave),
-        "TENANT_ROLE_ARN": t["provisioner_role_arn"],
-        "EXTERNAL_ID": t["external_id"],
-        "STATE_BUCKET": t["state_bucket"],
-        "LOCK_TABLE": t["lock_table"]
+        "TENANT_CONTEXT": json.dumps(tenant_ctx)
     })
     return {"status": "queued", "jenkins_code": code, "execution_id": exec_id}
 
 @waves_router.post("/{wave_id}/execute")
-def execute_wave(wave_id: str):
-    wave = WAVES.get(wave_id)
-    if not wave: return JSONResponse(status_code=404, content={"error": "wave not found"})
-    t = TENANTS.get(wave["tenant_id"])
-    if not t:     return JSONResponse(status_code=400, content={"error": "tenant not registered"})
+def execute_wave(wave_id: str, payload: Optional[WaveCreate] = Body(default=None)):
+    wave = payload.dict() if payload else WAVES.get(wave_id)
+    if not wave:
+        return JSONResponse(status_code=404, content={"error": "wave not found; include payload or create first"})
+    if not TENANTS.get(wave["tenant_id"]):
+        return JSONResponse(status_code=400, content={"error": "tenant not registered"})
+
+    WAVES[wave_id] = wave
+    tenant_ctx = _tenant_context_for_wave(wave)
 
     exec_id = f"exec-{uuid4().hex[:10]}"
     EXECUTIONS[exec_id] = {"wave_id": wave_id, "job": "maas-execute"}
     code = _jenkins_build("maas-execute", {
         "WAVE_ID": wave_id,
         "WAVE_JSON": json.dumps(wave),
-        "TENANT_ROLE_ARN": t["provisioner_role_arn"],
-        "EXTERNAL_ID": t["external_id"],
-        "STATE_BUCKET": t["state_bucket"],
-        "LOCK_TABLE": t["lock_table"]
+        "TENANT_CONTEXT": json.dumps(tenant_ctx)
     })
     return {"status": "queued", "jenkins_code": code, "execution_id": exec_id}
 
 @waves_router.post("/{wave_id}/cutover")
-def cutover_wave(wave_id: str, mode: Literal["test","prod"] = Query(...)):
-    wave = WAVES.get(wave_id)
-    if not wave: return JSONResponse(status_code=404, content={"error": "wave not found"})
-    t = TENANTS.get(wave["tenant_id"])
-    if not t:     return JSONResponse(status_code=400, content={"error": "tenant not registered"})
+def cutover_wave(
+    wave_id: str,
+    mode: Literal["test","prod"] = Query(...),
+    payload: Optional[WaveCreate] = Body(default=None)
+):
+    wave = payload.dict() if payload else WAVES.get(wave_id)
+    if not wave:
+        return JSONResponse(status_code=404, content={"error": "wave not found; include payload or create first"})
+    if not TENANTS.get(wave["tenant_id"]):
+        return JSONResponse(status_code=400, content={"error": "tenant not registered"})
+
+    WAVES[wave_id] = wave
+    tenant_ctx = _tenant_context_for_wave(wave)
 
     exec_id = f"exec-{uuid4().hex[:10]}"
     EXECUTIONS[exec_id] = {"wave_id": wave_id, "job": "maas-cutover", "mode": mode}
@@ -812,10 +965,7 @@ def cutover_wave(wave_id: str, mode: Literal["test","prod"] = Query(...)):
         "WAVE_ID": wave_id,
         "MODE": mode,
         "WAVE_JSON": json.dumps(wave),
-        "TENANT_ROLE_ARN": t["provisioner_role_arn"],
-        "EXTERNAL_ID": t["external_id"],
-        "STATE_BUCKET": t["state_bucket"],
-        "LOCK_TABLE": t["lock_table"]
+        "TENANT_CONTEXT": json.dumps(tenant_ctx)
     })
     return {"status": "queued", "jenkins_code": code, "execution_id": exec_id}
 
@@ -829,21 +979,19 @@ def get_execution_logs(exec_id: str):
     if not num:
         return {"status": "queued", "logs": ""}
 
-    # progressive console
     log = requests.get(
         f"{JENKINS_URL}/job/{job}/{num}/logText/progressiveText",
         auth=(JENKINS_USER, JENKINS_TOKEN),
         verify=False
     ).text
 
-    # status
     jb = requests.get(
         f"{JENKINS_URL}/job/{job}/{num}/api/json",
         auth=(JENKINS_USER, JENKINS_TOKEN),
         verify=False
     ).json()
     state = (jb.get("result") or "RUNNING").lower()
-    return {"status": "succeeded" if state == "success" else ("failed" if state=="failure" else "running"),
+    return {"status": "succeeded" if state == "success" else ("failed" if state == "failure" else "running"),
             "logs": log}
 
 @waves_router.get("/{wave_id}/summary")
@@ -858,7 +1006,6 @@ def wave_summary(wave_id: str):
     for pl in wave["placements"]:
         if pl["provider"] == "aws":
             p = AwsPlacementParams(**pl["params"])
-            # simple “what will be created” for AWS
             items += [
               f"[{pl['id']}] ALB + listeners",
               f"[{pl['id']}] 2 Target Groups (test/prod)",
@@ -868,7 +1015,6 @@ def wave_summary(wave_id: str):
             ]
             if p.attach_backup:
                 items.append(f"[{pl['id']}] AWS Backup plan (tag-based) + vault")
-            # rough cost
             itypes = [p.instance_type_map.get(t) or next(iter(p.instance_type_map.values())) for t in wave["targets"]]
             hourly += _estimate_cost_usd_per_hour(itypes)
 
@@ -883,7 +1029,6 @@ def wave_summary(wave_id: str):
     }
 
 # ---------- Cost & summary helpers ----------
-
 def _estimate_cost_usd_per_hour(instance_types: List[str]) -> float:
     table = {
         "nano": 0.005, "micro": 0.01, "small": 0.02, "medium": 0.05,
@@ -895,8 +1040,7 @@ def _estimate_cost_usd_per_hour(instance_types: List[str]) -> float:
         total += table.get(size, 0.12)
     return round(total, 4)
 
-def _aws_summary_for_placement(targets: List[str], params: AWSPlacementParams) -> Dict[str, object]:
-    # pick a type per target (default to first value)
+def _aws_summary_for_placement(targets: List[str], params: AwsPlacementParams) -> Dict[str, object]:
     default_type = next(iter(params.instance_type_map.values()), None)
     types = [(params.instance_type_map.get(t) or default_type) for t in targets if (params.instance_type_map.get(t) or default_type)]
     hourly = _estimate_cost_usd_per_hour(types)
@@ -917,5 +1061,5 @@ def _aws_summary_for_placement(targets: List[str], params: AWSPlacementParams) -
         "monthly_estimate_usd": round(hourly * 730, 2)
     }
 
-# Register the new router
+# Register the router
 app.include_router(waves_router)

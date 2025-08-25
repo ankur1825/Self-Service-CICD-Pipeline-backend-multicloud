@@ -11,6 +11,8 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
+RUN mkdir -p /app/schemas
+
 # Stage 2: Runtime
 FROM python:3.11-slim
 

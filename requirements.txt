@@ -1,7 +1,7 @@
 fastapi 
 uvicorn 
 boto3 
-pydantic
+pydantic<2.0
 requests
 ldap3
 sqlalchemy
