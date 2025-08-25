@@ -13,7 +13,7 @@ resource "aws_lb" "app" {
   name               = "maas-alb"
   load_balancer_type = "application"
   security_groups    = var.security_group_ids
-  subnets            = var.subnet_ids
+  subnets            = local.effective_subnet_ids   # <= was var.subnet_ids
   tags               = var.tags
 }
 
@@ -60,7 +60,7 @@ resource "aws_autoscaling_group" "asg" {
   desired_capacity    = length(var.instance_type_map)
   min_size            = 0
   max_size            = length(var.instance_type_map)
-  vpc_zone_identifier = var.subnet_ids
+  vpc_zone_identifier = local.effective_subnet_ids  # <= was var.subnet_ids
   launch_template { 
     id = aws_launch_template.lt.id 
     version = "$Latest" 
