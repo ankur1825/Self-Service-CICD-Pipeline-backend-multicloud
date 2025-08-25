@@ -74,17 +74,6 @@ resource "aws_backup_plan" "this" {
   tags = var.tags
 }
 
-# --- IAM role used by selection ---
-data "aws_iam_policy_document" "assume_backup" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["backup.amazonaws.com"]
-    }
-  }
-}
 
 # --- IAM role: create-or-use ---
 data "aws_iam_policy_document" "assume_backup" {
