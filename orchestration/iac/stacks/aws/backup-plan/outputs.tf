@@ -1,5 +1,5 @@
 output "vault_name" {
-  value = aws_backup_vault.src.name
+  value = local.vault_name
 }
 
 output "plan_id" {
