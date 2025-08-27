@@ -15,7 +15,7 @@ import hmac
 import hashlib
 from uuid import uuid4
 from pathlib import Path
-from typing import List, Optional, Dict, Literal, Any, Set
+from typing import List, Optional, Dict, Literal, Any, Set, Tuple
 
 try:
     import boto3
@@ -654,8 +654,8 @@ def _cache_get(bucket: dict, key: str):
         return None
     return value
 
-def _cache_put(bucket: dict, key: str, value):
-    bucket[key] = (value, time.time() + _CACHE_TTL)
+def _cache_put(bucket: dict, key: str, value, ttl: int = _CACHE_TTL):
+    bucket[key] = (value, time.time() + ttl)
 
 def _lookup_account_conf(tenant_id: str, account_ref: str | None) -> dict:
     """
@@ -810,14 +810,148 @@ def list_instance_types(
     _cache_put(_META_CACHE["instance_types"], cache_key, static)
     return {"instance_types": static, "source": "static"}
 
-# ----------------- Simple pricing helper -----------------
+# ----------------- Pricing (AWS) -----------------
+
+# AWS Pricing wants region *names*, not codes:
+_AWS_REGION_CODE_TO_NAME = {
+    "us-east-1": "US East (N. Virginia)",
+    "us-east-2": "US East (Ohio)",
+    "us-west-1": "US West (N. California)",
+    "us-west-2": "US West (Oregon)",
+    "eu-central-1": "EU (Frankfurt)",
+    "eu-west-1": "EU (Ireland)",
+    "eu-west-2": "EU (London)",
+    "ap-south-1": "Asia Pacific (Mumbai)",
+    "ap-southeast-1": "Asia Pacific (Singapore)",
+    "ap-southeast-2": "Asia Pacific (Sydney)",
+    "ap-northeast-1": "Asia Pacific (Tokyo)",
+}
+
+# quick local fallback (approx OD Linux shared in us-east-1)
+_LOCAL_OD_FALLBACK = {
+    "t3.nano": 0.0052,
+    "t3.micro": 0.0104,
+    "t3.small": 0.0208,
+    "t3.medium": 0.0416,
+    "m6i.large": 0.096,
+    "m6i.xlarge": 0.192,
+}
+
+_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}  # key -> (value, expires_at)
+_PRICE_TTL = 3600
+
+def _price_cache_get(key: str) -> Optional[float]:
+    rec = _PRICE_CACHE.get(key)
+    if not rec:
+        return None
+    val, exp = rec
+    if time.time() > exp:
+        _PRICE_CACHE.pop(key, None)
+        return None
+    return val
+
+def _price_cache_put(key: str, value: float):
+    _PRICE_CACHE[key] = (value, time.time() + _PRICE_TTL)
+
+def _aws_pricing_client():
+    # Pricing API lives in us-east-1 (or ap-south-1); use us-east-1 by default
+    if not boto3:
+        raise RuntimeError("boto3 not available")
+    return boto3.client("pricing", region_name="us-east-1")
+
+def _lookup_ondemand_price_usd(instance_type: str, region_code: str, os: str, tenancy: str) -> Optional[float]:
+    """
+    Query AWS Pricing for On-Demand hourly USD for a given instance type/region/os/tenancy.
+    Returns None on failure (caller uses fallback).
+    """
+    try:
+        location = _AWS_REGION_CODE_TO_NAME.get(region_code)
+        if not location:
+            return None
+
+        cache_key = f"{instance_type}:{region_code}:{os}:{tenancy}:OnDemand"
+        cached = _price_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        pricing = _aws_pricing_client()
+        # Pricing API uses string filters; values are case sensitive
+        # OS: Linux | Windows | RHEL | SUSE | etc.
+        # Tenancy: Shared | Dedicated | Host
+        paginator = pricing.get_paginator("get_products")
+        pages = paginator.paginate(
+            ServiceCode="AmazonEC2",
+            Filters=[
+                {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_type},
+                {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": os},
+                {"Type": "TERM_MATCH", "Field": "tenancy", "Value": tenancy},
+                {"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"},
+                {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+                {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": "No License required"},
+            ],
+            FormatVersion="aws_v1",
+        )
+
+        for page in pages:
+            for price_str in page.get("PriceList", []):
+                try:
+                    prod = json.loads(price_str)
+                except Exception:
+                    continue
+                terms = prod.get("terms", {}).get("OnDemand", {})
+                for _term_code, term in terms.items():
+                    price_dims = term.get("priceDimensions", {})
+                    for _dim_code, dim in price_dims.items():
+                        usd = dim.get("pricePerUnit", {}).get("USD")
+                        if usd is not None:
+                            val = float(usd)
+                            _price_cache_put(cache_key, val)
+                            return val
+        return None
+    except Exception as e:
+        logger.debug(f"Pricing lookup failed for {instance_type}/{region_code}: {e}")
+        return None
+
+def _estimate_price_on_demand(region: str, instance_types: List[str], os: str, tenancy: str) -> Dict[str, Any]:
+    """
+    Returns per-type items and total using AWS Pricing if available, else fallback.
+    """
+    items = []
+    total = 0.0
+    for it in instance_types:
+        val = _lookup_ondemand_price_usd(it, region, os, tenancy)
+        if val is None:
+            # fallback (rough): try exact, else map by size suffix
+            if it in _LOCAL_OD_FALLBACK:
+                val = _LOCAL_OD_FALLBACK[it]
+            else:
+                size = (it or "").split(".")[-1]
+                rough = {
+                    "nano": 0.005, "micro": 0.010, "small": 0.020, "medium": 0.040,
+                    "large": 0.080, "xlarge": 0.160, "2xlarge": 0.320, "4xlarge": 0.640
+                }
+                val = rough.get(size, 0.12)
+        items.append({"instance_type": it, "hourly_usd": round(val, 6)})
+        total += float(val)
+    return {"items": items, "hourly_usd": round(total, 6), "monthly_usd": round(total * 730, 2)}
+
+# ----------------- Simple pricing API (updated) -----------------
 class PricingReq(BaseModel):
+    region: str
     instance_types: List[str]
+    os: Literal["Linux", "Windows"] = "Linux"
+    tenancy: Literal["Shared", "Dedicated", "Host"] = "Shared"
+    purchase_option: Literal["OnDemand", "Reserved"] = "OnDemand"
 
 @app.post("/cloud/aws/pricing/estimate")
 def estimate_price(req: PricingReq):
-    hourly = _estimate_cost_usd_per_hour(req.instance_types)
-    return {"hourly_usd": hourly, "monthly_usd": round(hourly * 730, 2)}
+    # Only On-Demand implemented for live pricing; fall back otherwise.
+    if req.purchase_option != "OnDemand":
+        result = _estimate_price_on_demand(req.region, req.instance_types, req.os, req.tenancy)
+        result["note"] = "Reserved pricing not implemented; showing OnDemand approximation"
+        return result
+    return _estimate_price_on_demand(req.region, req.instance_types, req.os, req.tenancy)
 
 # ---------- Jenkins helper ----------
 def _jenkins_build(job: str, params: dict) -> int:
@@ -1016,7 +1150,8 @@ def wave_summary(wave_id: str):
             if p.attach_backup:
                 items.append(f"[{pl['id']}] AWS Backup plan (tag-based) + vault")
             itypes = [p.instance_type_map.get(t) or next(iter(p.instance_type_map.values())) for t in wave["targets"]]
-            hourly += _estimate_cost_usd_per_hour(itypes)
+            # Fast local estimate for summaries
+            hourly += _estimate_cost_usd_per_hour_local(itypes)
 
     return {
         "id": wave_id,
@@ -1028,8 +1163,46 @@ def wave_summary(wave_id: str):
         "estimated_cost_per_month_usd": round(hourly * 730, 2)
     }
 
-# ---------- Cost & summary helpers ----------
-def _estimate_cost_usd_per_hour(instance_types: List[str]) -> float:
+# --- Super admins (POC) ---
+SUPER_ADMINS = {"ankur.kashyap"}  # username from LDAP login (not the email)
+def _is_super_admin(username: str | None) -> bool:
+    return bool(username and username in SUPER_ADMINS)
+
+@waves_router.post("/{wave_id}/destroy")
+def destroy_wave(
+    wave_id: str,
+    requested_by: str = Query(..., description="username of the caller"),
+    payload: Optional[WaveCreate] = Body(default=None),
+):
+    # RBAC
+    if not _is_super_admin(requested_by):
+        return JSONResponse(status_code=403, content={"error": "forbidden: super admin only"})
+
+    # Resolve wave content (allow stateless call)
+    wave = payload.dict() if payload else WAVES.get(wave_id)
+    if not wave:
+        return JSONResponse(status_code=404, content={"error": "wave not found; include payload or create first"})
+    if not TENANTS.get(wave["tenant_id"]):
+        return JSONResponse(status_code=400, content={"error": "tenant not registered"})
+
+    # Save latest and build tenant context
+    WAVES[wave_id] = wave
+    tenant_ctx = _tenant_context_for_wave(wave)
+
+    # Kick Jenkins "maas-destroy"
+    exec_id = f"exec-{uuid4().hex[:10]}"
+    EXECUTIONS[exec_id] = {"wave_id": wave_id, "job": "maas-destroy"}
+    code = _jenkins_build("maas-destroy", {
+        "WAVE_ID": wave_id,
+        "WAVE_JSON": json.dumps(wave),
+        "TENANT_CONTEXT": json.dumps(tenant_ctx),
+        "REQUESTED_BY": requested_by,
+    })
+    return {"status": "queued", "jenkins_code": code, "execution_id": exec_id}
+
+
+# ---------- Cost & summary helpers (local-only fast estimate) ----------
+def _estimate_cost_usd_per_hour_local(instance_types: List[str]) -> float:
     table = {
         "nano": 0.005, "micro": 0.01, "small": 0.02, "medium": 0.05,
         "large": 0.10, "xlarge": 0.20, "2xlarge": 0.40
@@ -1043,7 +1216,7 @@ def _estimate_cost_usd_per_hour(instance_types: List[str]) -> float:
 def _aws_summary_for_placement(targets: List[str], params: AwsPlacementParams) -> Dict[str, object]:
     default_type = next(iter(params.instance_type_map.values()), None)
     types = [(params.instance_type_map.get(t) or default_type) for t in targets if (params.instance_type_map.get(t) or default_type)]
-    hourly = _estimate_cost_usd_per_hour(types)
+    hourly = _estimate_cost_usd_per_hour_local(types)
     resources = [
         "ALB + listeners",
         "Target Groups (blue/green if enabled)",
