@@ -15,7 +15,7 @@ import hmac
 import hashlib
 from uuid import uuid4
 from pathlib import Path
-from typing import List, Optional, Dict, Literal, Any, Set, Tuple
+from typing import List, Optional, Dict, Literal, Any, Set, Tuple, Union
 
 try:
     import boto3
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 # With your ingress rewrite (/pipeline/api -> /), no root_path is needed.
 app = FastAPI()
+api = APIRouter() 
 
 Base.metadata.create_all(bind=engine)
 
@@ -84,7 +85,7 @@ def get_db():
 Path("schemas").mkdir(parents=True, exist_ok=True)
 app.mount("/schemas", StaticFiles(directory="schemas"), name="schemas")
 
-@app.get("/healthz")
+@api.get("/healthz")
 def healthz():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
@@ -186,6 +187,19 @@ class SmokeTest(BaseModel):
 # ---------- Cloud Migration: multi-placement models ----------
 Provider = Literal["aws", "azure", "gcp", "oci"]
 
+class SourceAwsEc2(BaseModel):
+    type: Literal["aws-ec2"] = "aws-ec2"
+    region: constr(regex=r"^[a-z]{2}-[a-z]+-\d$")
+    account_ref: constr(min_length=1)
+    server_ids: List[constr(min_length=1)] = Field(default_factory=list)
+
+class SourceExternal(BaseModel):
+    type: Literal["external"] = "external"
+    os: Literal["LINUX","WINDOWS"] = "LINUX"
+    replicate_all_data: bool = True
+
+SourceSpec = Union[SourceAwsEc2, SourceExternal]
+
 class AwsPlacementParams(BaseModel):
     region: constr(regex=r"^[a-z]{2}-[a-z]+-\d$")
     vpc_id: constr(regex=r"^vpc-([0-9a-f]{8}|[0-9a-f]{17})$")
@@ -204,6 +218,8 @@ class AwsPlacementParams(BaseModel):
     maintenance_window: Optional[constr(max_length=128)] = None
     copy_to_region: Optional[constr(regex=r"^[a-z]{2}-[a-z]+-\d$")] = None
     account_ref: constr(min_length=1)
+    replication_engine: Literal["mgn","rsync","none"] = "mgn"      # NEW
+    source: SourceSpec  
 
 class Placement(BaseModel):
     id: constr(min_length=1) = Field(default_factory=lambda: f"p-{uuid4().hex[:8]}")
@@ -710,11 +726,11 @@ def _aws_client(service: str, region: str, tenant_id: str, account_ref: str | No
     return sess.client(service, region_name=region)
 
 # ----------------- Regions -----------------
-@app.get("/cloud/aws/regions")
+@api.get("/cloud/aws/regions")
 def list_aws_regions(
     tenant_id: Optional[str] = None,
-    account_ref: Optional[str] = None,
-    include_opt_in: bool = True
+    account_ref: Optional[str] = Query(None, alias="accountRef"),
+    include_opt_in: bool = Query(True, alias="includeOptIn"),
 ):
     """
     Returns list of region codes.
@@ -755,12 +771,12 @@ def list_aws_regions(
         return {"regions": fallback, "source": "static", "warning": str(e)}
 
 # ----------------- Instance Types -----------------
-@app.get("/cloud/aws/instance-types")
+@api.get("/cloud/aws/instance-types")
 def list_instance_types(
     region: str,
     tenant_id: Optional[str] = None,
-    account_ref: Optional[str] = None,
-    family_prefix: Optional[str] = None  # e.g. "t3", "m6i", "c7g"
+    account_ref: Optional[str] = Query(None, alias="accountRef"),
+    family_prefix: Optional[str] = Query(None, alias="familyPrefix"),
 ):
     """
     Returns available instance types in a region.
@@ -944,9 +960,13 @@ class PricingReq(BaseModel):
     tenancy: Literal["Shared", "Dedicated", "Host"] = "Shared"
     purchase_option: Literal["OnDemand", "Reserved"] = "OnDemand"
 
-@app.post("/cloud/aws/pricing/estimate")
+@api.post("/cloud/aws/pricing/estimate")
 def estimate_price(req: PricingReq):
     # Only On-Demand implemented for live pricing; fall back otherwise.
+    try:
+        req.os = req.os.title()  # "linux" -> "Linux", "windows" -> "Windows"
+    except Exception:
+        pass
     if req.purchase_option != "OnDemand":
         result = _estimate_price_on_demand(req.region, req.instance_types, req.os, req.tenancy)
         result["note"] = "Reserved pricing not implemented; showing OnDemand approximation"
@@ -1134,24 +1154,47 @@ def wave_summary(wave_id: str):
     if not wave:
         return JSONResponse(status_code=404, content={"error": "wave not found"})
 
-    items = []
+    items: List[str] = []
     hourly = 0.0
 
     for pl in wave["placements"]:
-        if pl["provider"] == "aws":
-            p = AwsPlacementParams(**pl["params"])
-            items += [
-              f"[{pl['id']}] ALB + listeners",
-              f"[{pl['id']}] 2 Target Groups (test/prod)",
-              f"[{pl['id']}] ASGs + Launch Templates (x{len(wave['targets'])})",
-              f"[{pl['id']}] SGs + SSM instance profile",
-              f"[{pl['id']}] AWS MGN replication + converted AMIs"
-            ]
-            if p.attach_backup:
-                items.append(f"[{pl['id']}] AWS Backup plan (tag-based) + vault")
-            itypes = [p.instance_type_map.get(t) or next(iter(p.instance_type_map.values())) for t in wave["targets"]]
-            # Fast local estimate for summaries
-            hourly += _estimate_cost_usd_per_hour_local(itypes)
+        if pl["provider"] != "aws":
+            continue
+
+        # Validate/parse with Pydantic (includes source + replication_engine)
+        p = AwsPlacementParams(**pl["params"])
+
+        # --- Source description (new) ---
+        try:
+            if isinstance(p.source, SourceAwsEc2):
+                items.append(
+                    f"[{pl['id']}] Source: EC2 in {p.source.region} (acct {p.source.account_ref}); "
+                    f"servers={len(p.source.server_ids) or 'n/a'}"
+                )
+            elif isinstance(p.source, SourceExternal):
+                items.append(
+                    f"[{pl['id']}] Source: External {p.source.os}; "
+                    f"replicate_all={bool(p.source.replicate_all_data)}"
+                )
+        except Exception as e:
+            items.append(f"[{pl['id']}] Source: (unparsed) {e}")
+
+        # --- Target landing zone + migration components ---
+        items += [
+            f"[{pl['id']}] ALB + listeners",
+            f"[{pl['id']}] 2 Target Groups (test/prod)",
+            f"[{pl['id']}] ASGs + Launch Templates (x{len(wave['targets'])})",
+            f"[{pl['id']}] SGs + SSM instance profile",
+            f"[{pl['id']}] Replication engine: {p.replication_engine.upper()}",
+            f"[{pl['id']}] AWS MGN replication + converted AMIs",
+        ]
+        if p.attach_backup:
+            items.append(f"[{pl['id']}] AWS Backup plan (tag-based) + vault")
+
+        # Cost (fast local approx)
+        default_type = next(iter(p.instance_type_map.values()), None)
+        itypes = [(p.instance_type_map.get(t) or default_type) for t in wave["targets"] if (p.instance_type_map.get(t) or default_type)]
+        hourly += _estimate_cost_usd_per_hour_local(itypes)
 
     return {
         "id": wave_id,
@@ -1160,7 +1203,7 @@ def wave_summary(wave_id: str):
         "targets_count": len(wave["targets"]),
         "resources": items,
         "estimated_cost_per_hour_usd": round(hourly, 4),
-        "estimated_cost_per_month_usd": round(hourly * 730, 2)
+        "estimated_cost_per_month_usd": round(hourly * 730, 2),
     }
 
 # --- Super admins (POC) ---
@@ -1236,3 +1279,5 @@ def _aws_summary_for_placement(targets: List[str], params: AwsPlacementParams) -
 
 # Register the router
 app.include_router(waves_router)
+app.include_router(api)          
+app.include_router(api, prefix="/pipeline/api") 

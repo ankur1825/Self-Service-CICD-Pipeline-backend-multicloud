@@ -54,3 +54,8 @@ variable "instance_type" {
   type    = string
   default = "m6i.large"
 }
+variable "image_id" {
+  description = "AMI for Launch Template; if null, auto-select latest Amazon Linux 2023"
+  type        = string
+  default     = null
+}

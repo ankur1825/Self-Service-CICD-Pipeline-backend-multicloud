@@ -42,10 +42,28 @@ resource "aws_lb_listener" "http" {
     }
 }
 
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter { 
+    name = "name"         
+    values = ["al2023-ami-*-x86_64"] 
+    } # adjust to arm64 if needed
+  filter { 
+    name = "state"        
+    values = ["available"] 
+    }
+}
+
+locals {
+  lt_image_id = var.image_id != null && var.image_id != "" ? var.image_id : data.aws_ami.al2023.id
+}
+
 # A generic Launch Template. AMI IDs will be *overridden* by MGN at cutover.
 resource "aws_launch_template" "lt" {
   name_prefix   = "maas-lt-"
-  image_id      = "ami-00000000000000000"  # placeholder; MGN overrides on launch
+  image_id      = local.lt_image_id      #"ami-00000000000000000"   placeholder; MGN overrides on launch
   instance_type = local.primary_it
   vpc_security_group_ids = var.security_group_ids
   tag_specifications { 
