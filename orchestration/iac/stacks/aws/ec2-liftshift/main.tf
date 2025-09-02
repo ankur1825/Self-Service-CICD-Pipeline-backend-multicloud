@@ -75,9 +75,9 @@ resource "aws_launch_template" "lt" {
 
 resource "aws_autoscaling_group" "asg" {
   name                = "maas-asg"
-  desired_capacity    = length(var.instance_type_map)
+  desired_capacity    = var.desired_capacity
   min_size            = 0
-  max_size            = length(var.instance_type_map)
+  max_size            = var.desired_capacity
   vpc_zone_identifier = local.effective_subnet_ids
 
   # If there is only ONE instance type, attach the LT directly

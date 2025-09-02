@@ -59,3 +59,8 @@ variable "image_id" {
   type        = string
   default     = null
 }
+variable "desired_capacity" {
+  type        = number
+  description = "ASG desired capacity"
+  default     = 1
+}
